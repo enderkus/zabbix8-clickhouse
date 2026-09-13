@@ -121,7 +121,7 @@ services:
       ZBX_HISTORYPROVIDERS: >-
         {"types":["uint","dbl","str","log","text","json"],"provider":"clickhouse","url":"http://clickhouse:8123","db":"zabbix","username":"default","password":"changeme"}
     ports:
-      - "8081:8080"   # Zabbix UI: http://localhost:8081 (Admin/zabbix)
+      - "8080:8080"   # Zabbix UI: http://localhost:8080 (Admin/zabbix)
     networks:
       - zabbix-net
     restart: unless-stopped

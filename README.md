@@ -14,7 +14,7 @@ ClickHouse right away.
 | `clickhouse`      | History storage backend                             | 8123 (HTTP), 9000 (native) |
 | `tabix`           | Web UI for browsing ClickHouse directly              | 8082         |
 | `zabbix-server`   | Zabbix server                                       | 10051        |
-| `zabbix-web`      | Zabbix frontend (nginx)                             | 8081         |
+| `zabbix-web`      | Zabbix frontend (nginx)                             | 8080         |
 | `zabbix-agent`    | Agent for the built-in "Zabbix server" host          | -            |
 | `test-agent-1/2`  | Extra agents to generate sample history data         | -            |
 | `clickhouse-init` | One-off: creates the ClickHouse schema (runs & exits) | -           |
@@ -29,7 +29,7 @@ docker compose up -d
 Wait about a minute for the one-off `clickhouse-init` and `zabbix-init`
 containers to finish (`docker compose logs -f zabbix-init`), then open:
 
-- Zabbix frontend: http://localhost:8081 (`Admin` / `zabbix`)
+- Zabbix frontend: http://localhost:8080 (`Admin` / `zabbix`)
 - ClickHouse Tabix UI: http://localhost:8082 (server `http://clickhouse:8123`
   from your browser use `http://localhost:8123`, user `default` / `changeme`)
 
