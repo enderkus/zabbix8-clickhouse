@@ -1,0 +1,201 @@
+services:
+  postgres-server:
+    image: postgres:17-alpine
+    container_name: zbx-postgres
+    environment:
+      POSTGRES_USER: zabbix
+      POSTGRES_PASSWORD: zabbix_pwd
+      POSTGRES_DB: zabbix
+    volumes:
+      - pgsql_data:/var/lib/postgresql/data
+    networks:
+      - zabbix-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zabbix -d zabbix"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: zbx-clickhouse
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: changeme
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+    ports:
+      - "8123:8123"   # HTTP interface (Play UI: http://localhost:8123/play)
+      - "9000:9000"   # Native TCP client
+    networks:
+      - zabbix-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # One-off: creates the zabbix DB + history_* tables in ClickHouse before
+  # zabbix-server starts writing to them. Runs once per `docker compose up`
+  # and exits; safe to re-run (skips tables that already exist).
+  clickhouse-init:
+    image: alpine:3.20
+    container_name: zbx-clickhouse-init
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - zabbix-net
+    volumes:
+      - ./clickhouse/init-history-tables.sh:/init.sh:ro
+    environment:
+      CH_URL: http://clickhouse:8123
+      CH_USER: default
+      CH_PASSWORD: changeme
+      CH_DB: zabbix
+    entrypoint: ["/bin/sh", "-c", "apk add --no-cache bash curl >/dev/null && bash /init.sh"]
+    restart: "no"
+
+  tabix:
+    image: spoonest/clickhouse-tabix-web-client:latest
+    container_name: zbx-tabix
+    depends_on:
+      - clickhouse
+    ports:
+      - "8082:80"     # Tabix UI: http://localhost:8082
+    networks:
+      - zabbix-net
+    restart: unless-stopped
+
+  zabbix-server:
+    image: zabbix/zabbix-server-pgsql:trunk-alpine
+    container_name: zbx-server
+    depends_on:
+      postgres-server:
+        condition: service_healthy
+      clickhouse-init:
+        condition: service_completed_successfully
+    environment:
+      DB_SERVER_HOST: postgres-server
+      POSTGRES_USER: zabbix
+      POSTGRES_PASSWORD: zabbix_pwd
+      POSTGRES_DB: zabbix
+      # The ClickHouse image tracks :latest, which can run ahead of the max
+      # version this Zabbix 8.0 devel build officially supports; override the check.
+      ZBX_ALLOWUNSUPPORTEDDBVERSIONS: 1
+      # ClickHouse history storage provider (Zabbix 8.0 feature).
+      ZBX_HISTORYPROVIDER_0: >-
+        clickhouse;value_types="uint,dbl,str,log,text,json",url=http://clickhouse:8123,db=zabbix,username=default,password=changeme
+    ports:
+      - "10051:10051"
+    networks:
+      - zabbix-net
+    restart: unless-stopped
+
+  zabbix-web:
+    image: zabbix/zabbix-web-nginx-pgsql:trunk-alpine
+    container_name: zbx-web
+    depends_on:
+      - zabbix-server
+      - postgres-server
+    environment:
+      DB_SERVER_HOST: postgres-server
+      POSTGRES_USER: zabbix
+      POSTGRES_PASSWORD: zabbix_pwd
+      POSTGRES_DB: zabbix
+      ZBX_SERVER_HOST: zabbix-server
+      ZBX_SERVER_NAME: "Zabbix 8 + ClickHouse"
+      PHP_TZ: Europe/Istanbul
+      # Same ClickHouse backend, mirrored for the frontend.
+      # NOTE: the docker entrypoint does `$HISTORY_PROVIDERS[] = env_json(...)`,
+      # i.e. it wraps the whole env value as ONE entry -- so this must be a
+      # single JSON object, not a JSON array of objects.
+      ZBX_HISTORYPROVIDERS: >-
+        {"types":["uint","dbl","str","log","text","json"],"provider":"clickhouse","url":"http://clickhouse:8123","db":"zabbix","username":"default","password":"changeme"}
+    ports:
+      - "8081:8080"   # Zabbix UI: http://localhost:8081 (Admin/zabbix)
+    networks:
+      - zabbix-net
+    restart: unless-stopped
+
+  # Agent for the built-in "Zabbix server" host. It's a separate container
+  # (not colocated with zabbix-server), so the "Zabbix server" host's agent
+  # interface has to point at this service's DNS name -- see zabbix-init.
+  zabbix-agent:
+    image: zabbix/zabbix-agent2:trunk-alpine
+    container_name: zbx-agent-server
+    hostname: zabbix-agent
+    environment:
+      ZBX_HOSTNAME: "Zabbix server"
+      ZBX_SERVER_HOST: zabbix-server
+    networks:
+      - zabbix-net
+    restart: unless-stopped
+
+  # --- Test/monitoring targets: separate containers to generate history data
+  # and verify it actually lands in ClickHouse.
+  test-agent-1:
+    image: zabbix/zabbix-agent2:trunk-alpine
+    container_name: zbx-test-agent-1
+    hostname: test-agent-1
+    environment:
+      ZBX_HOSTNAME: test-agent-1
+      ZBX_SERVER_HOST: zabbix-server
+    networks:
+      - zabbix-net
+    restart: unless-stopped
+
+  test-agent-2:
+    image: zabbix/zabbix-agent2:trunk-alpine
+    container_name: zbx-test-agent-2
+    hostname: test-agent-2
+    environment:
+      ZBX_HOSTNAME: test-agent-2
+      ZBX_SERVER_HOST: zabbix-server
+    networks:
+      - zabbix-net
+    restart: unless-stopped
+
+  # One-off: talks to the Zabbix API once the frontend is up to (1) fix the
+  # "Zabbix server" host's agent interface and (2) register the two test
+  # agents as monitored hosts, so a fresh `docker compose up` needs zero
+  # manual clicks in the UI. Safe to re-run.
+  zabbix-init:
+    image: alpine:3.20
+    container_name: zbx-init
+    depends_on:
+      - zabbix-web
+      - zabbix-agent
+      - test-agent-1
+      - test-agent-2
+    networks:
+      - zabbix-net
+    volumes:
+      - ./zabbix/provision.sh:/init.sh:ro
+    environment:
+      ZBX_API: http://zabbix-web:8080/api_jsonrpc.php
+      ZBX_USER: Admin
+      ZBX_PASSWORD: zabbix
+      AGENT_DNS: zabbix-agent
+      HOST_NAME: "Zabbix server"
+      TEST_GROUP: "Docker test hosts"
+      TEST_TEMPLATE: "Linux by Zabbix agent"
+    entrypoint: ["/bin/sh", "-c", "apk add --no-cache bash curl jq >/dev/null && bash /init.sh"]
+    restart: "no"
+
+networks:
+  zabbix-net:
+    driver: bridge
+
+volumes:
+  pgsql_data:
+  clickhouse_data:
+  clickhouse_logs:
